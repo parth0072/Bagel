@@ -24,6 +24,7 @@
 
 @implementation BagelBrowser {
     NSMutableArray* sockets;
+    BOOL didConnectFallback;
 }
 
 - (instancetype)initWithConfiguration:(BagelConfiguration*)configuration
@@ -32,6 +33,7 @@
 
     if (self) {
         self.configuration = configuration;
+        didConnectFallback = NO;
         [self startBrowsing];
     }
 
@@ -42,34 +44,44 @@
 {
     if (self.services) {
         [self.services removeAllObjects];
-
     } else {
         self.services = [[NSMutableArray alloc] init];
     }
 
     if (sockets) {
         [sockets removeAllObjects];
-
     } else {
         sockets = [[NSMutableArray alloc] init];
     }
 
     self.serviceBrowser = [[NSNetServiceBrowser alloc] init];
-    [self.serviceBrowser setDelegate:self];
-    [self.serviceBrowser searchForServicesOfType:self.configuration.netserviceType inDomain:self.configuration.netserviceDomain];
+    self.serviceBrowser.delegate = self;
+
+    // Fallback after 5 seconds if nothing found
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self.services.count == 0 && !didConnectFallback) {
+            NSLog(@"[Bagel] Bonjour discovery failed, falling back to localhost");
+            [self connectToHost:@"127.0.0.1" port:43435];
+            didConnectFallback = YES;
+        }
+    });
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.serviceBrowser searchForServicesOfType:self.configuration.netserviceType
+                                            inDomain:self.configuration.netserviceDomain];
+    });
 }
 
 - (void)netServiceBrowser:(NSNetServiceBrowser*)serviceBrowser didFindService:(NSNetService*)service moreComing:(BOOL)moreComing
 {
     [self.services addObject:service];
 
-    [service setDelegate:self];
+    service.delegate = self;
     [service resolveWithTimeout:30.0];
 }
 
 - (void)netServiceBrowser:(NSNetServiceBrowser*)serviceBrowser didRemoveService:(NSNetService*)service moreComing:(BOOL)moreComing
 {
-
     [self.services removeObject:service];
 }
 
@@ -80,26 +92,40 @@
 
 - (BOOL)connectWithService:(NSNetService*)service
 {
-    BOOL _isConnected = NO;
-
-    NSArray* addresses = [[service addresses] mutableCopy];
+    BOOL isConnected = NO;
+    NSMutableArray* addresses = [NSMutableArray arrayWithArray:[service addresses]];
 
     GCDAsyncSocket* socket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
 
-    while (!_isConnected && [addresses count]) {
+    while (!isConnected && [addresses count]) {
         NSData* address = [addresses objectAtIndex:0];
-
         NSError* error = nil;
+
         if ([socket connectToAddress:address error:&error]) {
             [sockets addObject:socket];
-
-            _isConnected = YES;
-
+            isConnected = YES;
         } else if (error) {
+            NSLog(@"[Bagel] Connect error: %@", error.localizedDescription);
         }
+
+        [addresses removeObjectAtIndex:0];
     }
 
-    return _isConnected;
+    return isConnected;
+}
+
+
+- (void)connectToHost:(NSString *)host port:(UInt16)port
+{
+    NSError *error = nil;
+    GCDAsyncSocket *socket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+
+    if ([socket connectToHost:host onPort:port error:&error]) {
+        NSLog(@"[Bagel] Connected to fallback host %@:%d", host, port);
+        [sockets addObject:socket];
+    } else {
+        NSLog(@"[Bagel] Fallback connection failed: %@", error.localizedDescription);
+    }
 }
 
 - (void)socket:(GCDAsyncSocket*)socket didConnectToHost:(NSString*)host port:(UInt16)port
@@ -118,17 +144,14 @@
     }
 
     if (packetData) {
-        
         NSMutableData* buffer = [[NSMutableData alloc] init];
-        
         uint64_t headerLength = [packetData length];
         [buffer appendBytes:&headerLength length:sizeof(uint64_t)];
         [buffer appendBytes:[packetData bytes] length:[packetData length]];
-        
+
         for (GCDAsyncSocket* socket in sockets) {
             [socket writeData:buffer withTimeout:-1.0 tag:0];
         }
-        
     }
 }
 
